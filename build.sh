@@ -16,7 +16,7 @@ fi
 
 # 2) Lilu-SDK (Header + plugin_start.cpp aus der DEBUG-Release)
 if [ ! -d "$DEPS/Lilu.kext" ]; then
-  ( cd "$DEPS" && src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/Lilu/master/Lilu/Scripts/bootstrap.sh) && eval "$src" )
+  ( cd "$DEPS" && set +eu && export TRAVIS_TAG="" && src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/Lilu/master/Lilu/Scripts/bootstrap.sh) && eval "$src" )
 fi
 LILU_SDK="$DEPS/Lilu.kext/Contents/Resources"
 test -f "$LILU_SDK/Headers/kern_api.hpp"
