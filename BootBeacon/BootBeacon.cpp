@@ -17,6 +17,7 @@
 //    -bbeacdbg        Lilu-Debug-Ausgabe
 //    -bbnobeep        keine Piepser
 //    -bbnonvram       keine NVRAM-Schreibzugriffe
+//    -bbnoraw         kein frueher Herzschlag ueber EC-Ports
 //    bbled=<maske>    LED-Bitmaske (Default 0x401 = Power-LED (0) + Deckel-i-Punkt (10))
 //    bbint=<sek>      NVRAM-Intervall in Sekunden (Default 10)
 //    bbmax=<n>        max. Anzahl NVRAM-Schreibvorgaenge (Default 90)
@@ -40,6 +41,9 @@
 #include <kern/clock.h>
 #include <sys/vnode.h>
 #include <sys/proc.h>
+#include <kern/thread.h>
+
+extern "C" boolean_t ml_set_interrupts_enabled(boolean_t enable);
 
 // ---------------------------------------------------------------------------
 // Kernel-Log-Puffer (xnu bsd/sys/msgbuf.h). Nicht exportiert -> Lilu loest
@@ -73,6 +77,81 @@ static uint32_t gMaxWrites = 90;
 static uint32_t gVarSize   = 3072;
 static bool     gNoBeep    = false;
 static bool     gNoNvram   = false;
+
+// ---------------------------------------------------------------------------
+// Frueher Herzschlag direkt ueber die EC-Ports 0x62/0x66 (ohne ACPI/IOKit).
+// Laeuft ab dem allerersten Code der Kext, bis der ACPI-EC-Teil uebernimmt.
+// Muster: Doppelblitz (an-aus-an-lange Pause).
+// ThinkPad-DSDT: LED(id, state) == WBEC(0x0C, id | state)
+// ---------------------------------------------------------------------------
+static volatile bool gECServiceUp = false;
+static volatile uint32_t gRawBlinks = 0;
+
+static inline uint8_t bb_inb(uint16_t port) {
+	uint8_t v;
+	__asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
+	return v;
+}
+
+static inline void bb_outb(uint16_t port, uint8_t v) {
+	__asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static bool bb_ecWaitIBF() {
+	for (int i = 0; i < 20000; i++) {       // ~20 ms max
+		if ((bb_inb(0x66) & 0x02) == 0)
+			return true;
+		IODelay(1);
+	}
+	return false;
+}
+
+static bool bb_ecWrite(uint8_t reg, uint8_t val) {
+	bool intr = ml_set_interrupts_enabled(false);
+	bool ok = bb_ecWaitIBF();
+	if (ok) { bb_outb(0x66, 0x81); ok = bb_ecWaitIBF(); }
+	if (ok) { bb_outb(0x62, reg);  ok = bb_ecWaitIBF(); }
+	if (ok) { bb_outb(0x62, val);  ok = bb_ecWaitIBF(); }
+	ml_set_interrupts_enabled(intr);
+	return ok;
+}
+
+static void bb_rawLeds(uint32_t mask, bool on) {
+	for (uint32_t id = 0; id < 16; id++)
+		if (mask & (1U << id))
+			bb_ecWrite(0x0C, static_cast<uint8_t>(id | (on ? 0x80 : 0x00)));
+}
+
+static void bb_rawThread(void *, wait_result_t) {
+	uint32_t mask = gLedMask;
+	uint32_t v;
+	if (PE_parse_boot_argn("bbled", &v, sizeof(v))) mask = v;
+	IOLog("BootBeacon: frueher Herzschlag gestartet\n");
+	while (!gECServiceUp) {
+		bb_rawLeds(mask, true);  IOSleep(120);
+		bb_rawLeds(mask, false); IOSleep(120);
+		bb_rawLeds(mask, true);  IOSleep(120);
+		bb_rawLeds(mask, false); IOSleep(640);
+		gRawBlinks++;
+	}
+	IOLog("BootBeacon: frueher Herzschlag beendet nach %u Zyklen\n", gRawBlinks);
+	thread_terminate(current_thread());
+}
+
+extern "C" kern_return_t BootBeacon_kern_start(kmod_info_t *, void *);
+
+// Echter Einstiegspunkt der Kext (siehe kmod_info.c): startet zuerst den
+// Herzschlag, dann den normalen Lilu-Plugin-Start.
+EXPORT extern "C" kern_return_t BootBeacon_real_start(kmod_info_t *ki, void *d) {
+	if (!checkKernelArgument("-bbeacoff") && !checkKernelArgument("-bbnoraw")) {
+		// Sofort einmal LED aus -> sichtbares Zeichen "Kext-Code laeuft"
+		bb_rawLeds(gLedMask, false);
+		thread_t th = nullptr;
+		if (kernel_thread_start(bb_rawThread, nullptr, &th) == KERN_SUCCESS && th)
+			thread_deallocate(th);
+	}
+	return BootBeacon_kern_start(ki, d);
+}
 
 // ---------------------------------------------------------------------------
 // Lilu-Plugin-Teil: nur Symbolaufloesung
@@ -302,6 +381,8 @@ bool BootBeaconEC::start(IOService *provider) {
 		return false;
 	}
 	ec->retain();
+	gECServiceUp = true;            // frueher Herzschlag hoert auf, ACPI uebernimmt
+	IOSleep(1100);                  // Raw-Thread sauber auslaufen lassen
 
 	hasLED  = ec->validateObject("LED") == kIOReturnSuccess;
 	hasBEEP = ec->validateObject("BEEP") == kIOReturnSuccess;

@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 DEPS="$ROOT/deps"
 OUT="$ROOT/build"
-VERSION="1.0.0"
+VERSION="1.1.0"
 mkdir -p "$DEPS" "$OUT"
 
 # 1) MacKernelSDK (Kernel-Header + libkmod.a)
